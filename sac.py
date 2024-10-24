@@ -12,8 +12,9 @@ import importlib
 import sys
 
 import dm_control
-tmp_dir = tempfile.mkdtemp()
 src_file = os.path.dirname(dm_control.__file__)
+
+tmp_dir = tempfile.mkdtemp()
 dst_dir = os.path.join(tmp_dir, 'dm_control')
 shutil.copytree(src_file, dst_dir)
 sys.path.insert(0, tmp_dir)
@@ -62,7 +63,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "sac_minari_dataset"
     """the wandb's project name"""
@@ -75,12 +76,18 @@ class Args:
     env_id: str = "CartPole-v1"
     """the environment id of the task"""
     length: float = 0.045
+    
+    cond_low: float = 0.1
+    """the lower bound of the pole length"""
+    cond_high: float = 0.7
+    """the upper bound of the pole length"""
+    
     """half pole length. 0.045 defalt"""
     cond: float = 0.045
     """half pole length. 0.045 defalt"""
-    num_envs: int = 6
+    num_envs: int = 1
     """the number of parallel game environments"""
-    total_timesteps: int = 500000
+    total_timesteps: int = 250000
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
@@ -108,6 +115,8 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     
     def __post_init__(self):
+        self.id = self.length
+        self.length = np.random.uniform(self.cond_low, self.cond_high, 1)[0]
         self.cond = set_pole_length(new_size = self.length)
         print(tmp_dir)
     #     self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -160,6 +169,15 @@ def make_env(env_id, seed, idx, capture_video, run_name, cond):
 
     return thunk
 
+def renew_envs(envs, seed, capture_video, run_name, cond_low, cond_high):
+    length = np.random.uniform(cond_low, cond_high, 1)[0]
+    cond = set_pole_length(new_size = length)
+    envs.close()
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(Args().env_id, seed, i, capture_video, run_name, cond) for i in range(Args().num_envs)], 
+        )
+    envs.reset(seed=seed)
+    return envs
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
@@ -319,6 +337,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    # renew_envs(envs, args.seed, args.capture_video, run_name, args.cond_low, args.cond_high)
                     break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -399,7 +418,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     if Args().if_record:
         for i, env in enumerate(envs.envs):
             dataset = env.create_dataset(
-            dataset_id="dm-cartpole-test-length{}-v{}".format(args.cond, i),
+            dataset_id="dm-cartpole-test-length{}-v{}".format(args.id, i),
             algorithm_name="SAC",
             # code_permalink="https://github.com/Farama-Foundation/Minari",
             author="BoxuLiu",

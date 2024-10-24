@@ -98,7 +98,7 @@ class TrainConfig:
     # Diffusion config
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     # Network size
-    network_width: int = 256
+    network_width: int = 128
     network_depth: int = 2
 
     def __post_init__(self):
@@ -372,6 +372,7 @@ class ImplicitQLearning:
         qs = self.qf.both(observations, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
         log_dict["q_loss"] = q_loss.item()
+        log_dict["q_value"] = qs[0].mean().item()
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
         self.q_optimizer.step()

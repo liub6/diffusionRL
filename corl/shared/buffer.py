@@ -11,7 +11,8 @@ import torch
 from typing import Tuple
 
 from synther.diffusion.norm import MinMaxNormalizer
-from synther.diffusion.utils import make_inputs, construct_diffusion_model, split_diffusion_samples
+from synther.diffusion.utils import make_inputs, construct_diffusion_model
+from synther.diffusion.elucidated_diffusion import split_diffusion_samples
 
 from dmc2gymnasium import DMCGym
 
@@ -217,6 +218,7 @@ class DiffusionGenerator(ReplayBufferBase):
     def __init__(
             self,
             env_name: str,
+            dataset: Dict[str, np.ndarray],
             diffusion_path: str,
             use_ema: bool = True,
             num_steps: int = 32,
@@ -234,7 +236,8 @@ class DiffusionGenerator(ReplayBufferBase):
         if env_name == 'cartpole':
             self.env = DMCGym("cartpole", "swingup")
             # self.env = gym.wrappers.RecordEpisodeStatistics(self.env)
-            inputs = make_inputs("dm-cartpole-test-length-all-v0")
+            # inputs = make_inputs("dm-cartpole-test-length-all-v0")
+            inputs = dataset
         else:
             self.env = gym.make(env_name)
             inputs = make_inputs(self.env)
@@ -312,6 +315,108 @@ class DiffusionGenerator(ReplayBufferBase):
             self.cache_pointer += batch_size
             return batch
 
+from tqdm import trange
+from dm_control import suite
+
+def _flatten_obs(obs, dtype=np.float32):
+    obs_pieces = []
+    for v in obs.values():
+        flat = np.array([v]) if np.isscalar(v) else v.ravel()
+        obs_pieces.append(flat)
+    return np.concatenate(obs_pieces, axis=0).astype(dtype)
+
+def reset_to_state(env, state):
+    env._reset_next_step = False
+    env._step_count = 0
+    with env._physics.reset_context():
+        env._physics.named.data.qpos[:] = np.array([state[0], state[1]])
+        env._physics.named.data.qvel[:] = np.array([state[2], state[3]])
+    env._task.after_step(env._physics)
+    
+def calculate_diffusion_loss(diffusion_dataset, env, range = None):
+    if range is None:
+        range = diffusion_dataset["observations"].shape[0]
+    reward_loss = np.zeros((range, 1))
+    observation_loss = np.zeros((range, diffusion_dataset["observations"].shape[1]))
+
+    # for transition in trange(diffusion_dataset["observations"].shape[0]):
+    for transition in trange(range):
+        index = np.ones(diffusion_dataset["observations"].shape[1], dtype=bool)
+        index[2] = False
+        observation = diffusion_dataset["observations"][transition]
+        state = observation[index]
+        # state[1] = np.arccos(state[1].clip(-1, 1))
+        state[1] = np.arctan2(observation[2], observation[1])
+        action = diffusion_dataset["actions"][transition]
+        reward = diffusion_dataset["rewards"][transition]
+        next_observation = diffusion_dataset["next_observations"][transition]
+
+        # if transition == 0:
+        #     print(observation, action, reward, next_observation)
+        reset_to_state(env, state)
+        timestamp = env.step(action)
+        reward_true = timestamp.reward
+        next_observation_true = _flatten_obs(timestamp.observation)
+        reward_loss[transition, :] = np.abs(reward - reward_true)
+        observation_loss[transition, :] = np.abs(next_observation - next_observation_true)
+    return observation_loss, reward_loss
+
+def filter_data(loss, percentile):
+    pos1_percentile = np.percentile(loss[:, 0], percentile)
+
+    pos2_percentile = np.percentile(loss[:, 1], percentile)
+
+    pos3_percentile = np.percentile(loss[:, 2], percentile)
+
+    vel1_percentile = np.percentile(loss[:, 3], percentile)
+
+    vel2_percentile = np.percentile(loss[:, 4], percentile)
+
+    reward_percentile = np.percentile(loss[:, 5], percentile)
+
+    filtered_out_indices = np.where((loss[:, 0] >= pos1_percentile) & 
+                                     (loss[:, 1] >= pos2_percentile) &
+                                     (loss[:, 2] >= pos3_percentile) &
+                                        (loss[:, 3] >= vel1_percentile) &
+                                        (loss[:, 4] >= vel2_percentile) &
+                                        (loss[:, 5] >= reward_percentile))[0]
+    indices = np.where((loss[:, 0] <= pos1_percentile) &
+                                     (loss[:, 1] <= pos2_percentile) &
+                                     (loss[:, 2] <= pos3_percentile) &
+                                        (loss[:, 3] <= vel1_percentile) &
+                                        (loss[:, 4] <= vel2_percentile) &
+                                        (loss[:, 5] <= reward_percentile))[0]
+    # indices = np.where((loss[:, 0] <= 0.005) &
+    #                                  (loss[:, 1] <= 0.005) &
+    #                                  (loss[:, 2] <= 0.005) &
+    #                                     (loss[:, 3] <= 0.01) &
+    #                                     (loss[:, 4] <= 0.01) &
+    #                                     (loss[:, 5] <= 0.001))[0]
+    return filtered_out_indices, indices
+
+def filter_by_boundary(training_dataset, diffusion_dataset):
+    indices = np.arange(0,diffusion_dataset["observations"].shape[0])
+    for key in diffusion_dataset.keys():
+        if (key == "observations") | (key == "next_observations"):
+            boundary_Pos1 = (training_dataset[key][:,0].min(), training_dataset[key][:,0].max())
+            boundary_Pos2 = (training_dataset[key][:,1].min(), training_dataset[key][:,1].max())
+            boundary_Pos3 = (training_dataset[key][:,2].min(), training_dataset[key][:,2].max())
+            boundary_Vel1 = (training_dataset[key][:,3].min(), training_dataset[key][:,3].max())
+            boundary_Vel2 = (training_dataset[key][:,4].min(), training_dataset[key][:,4].max())
+            
+            filtered_indices = np.where(((diffusion_dataset[key][:,0] >= boundary_Pos1[0]) & (diffusion_dataset[key][:,0] <= boundary_Pos1[1])) &
+                                ((diffusion_dataset[key][:,1] >= boundary_Pos2[0]) & (diffusion_dataset[key][:,1] <= boundary_Pos2[1])) &
+                                ((diffusion_dataset[key][:,2] >= boundary_Pos3[0]) & (diffusion_dataset[key][:,2] <= boundary_Pos3[1])))[0]
+                                # ((diffusion_dataset[key][:,3] >= boundary_Vel1[0]) & (diffusion_dataset[key][:,3] <= boundary_Vel1[1])) &
+                                # ((diffusion_dataset[key][:,4] >= boundary_Vel2[0]) & (diffusion_dataset[key][:,4] <= boundary_Vel2[1]))
+            
+        else:
+            boundary = (training_dataset[key].min(), training_dataset[key].max())
+            filtered_indices = np.where((diffusion_dataset[key] >= boundary[0]) & (diffusion_dataset[key] <= boundary[1]))[0]
+        
+        indices = np.intersect1d(indices, filtered_indices)
+    
+    return {key: diffusion_dataset[key][indices] for key in diffusion_dataset.keys()}
 
 def prepare_replay_buffer(
         state_dim: int,
@@ -320,12 +425,15 @@ def prepare_replay_buffer(
         dataset: Dict[str, np.ndarray],
         env_name: str,
         diffusion_config: DiffusionConfig,
-        device: str = "cpu",
+        device: str = "cuda",
         reward_normalizer: Optional[RewardNormalizer] = None,
         state_normalizer: Optional[StateNormalizer] = None,
         cond_dim: Optional[int] = None,
         context_aware:bool = False,
         context: float = 1.0,
+        percentile: Optional[int] = None,
+        env = None,
+        
 ):
     buffer_args = {
         'reward_normalizer': reward_normalizer,
@@ -336,9 +444,25 @@ def prepare_replay_buffer(
         print(f'Loading diffusion dataset from {diffusion_config.path}.')
         diffusion_dataset = np.load(diffusion_config.path)
         diffusion_dataset = {key: diffusion_dataset[key] for key in diffusion_dataset.files}
+        
+
 
         for key in diffusion_dataset.keys():
-            diffusion_dataset[key] = diffusion_dataset[key][:dataset['rewards'].shape[0]//2]
+            diffusion_dataset[key] = diffusion_dataset[key][:dataset['rewards'].shape[0]]
+        diffusion_length = diffusion_dataset['rewards'].shape[0]
+            
+        if percentile is not None:
+            range = diffusion_dataset['rewards'].shape[0]
+            # **********************************************************
+            # if env is None:
+            #     env = suite.load(domain_name="cartpole", task_name="swingup")
+            # observation_erro, reward_erro = calculate_diffusion_loss(diffusion_dataset, env, range)
+            # erro = np.concatenate([observation_erro, reward_erro], axis=1)
+            # filtered_out_indices, indices = filter_data(erro, percentile)
+            # diffusion_dataset = {key: diffusion_dataset[key][indices] for key in diffusion_dataset.keys()}
+            # **********************************************************
+            diffusion_dataset = filter_by_boundary(dataset, diffusion_dataset)
+            print('Limited diffusion dataset to {} samples'.format(diffusion_dataset['rewards'].shape[0] / diffusion_length))
             
         # for key in dataset.keys():
         #     dataset[key] = dataset[key][:1]
@@ -380,7 +504,7 @@ def prepare_replay_buffer(
         replay_buffer = ReplayBuffer(
             state_dim=state_dim,
             action_dim=action_dim,
-            buffer_size=buffer_size,
+            buffer_size=dataset['rewards'].shape[0],
             **buffer_args,
         )
         replay_buffer.load_dataset(dataset, context_aware=context_aware)
@@ -388,6 +512,18 @@ def prepare_replay_buffer(
         print(f'Loading diffusion dataset from {diffusion_config.path}.')
         diffusion_dataset = np.load(diffusion_config.path)
         diffusion_dataset = {key: diffusion_dataset[key] for key in diffusion_dataset.files}
+        
+        diffusion_length = diffusion_dataset['rewards'].shape[0]
+        if percentile is not None:
+            range = diffusion_dataset['rewards'].shape[0]
+            if env is None:
+                env = suite.load(domain_name="cartpole", task_name="swingup")
+            observation_erro, reward_erro = calculate_diffusion_loss(diffusion_dataset, env, range)
+            erro = np.concatenate([observation_erro, reward_erro], axis=1)
+            filtered_data, indices = filter_data(erro, percentile)
+            diffusion_dataset = {key: diffusion_dataset[key][indices] for key in diffusion_dataset.keys()}
+            print('Limited diffusion dataset to {} samples'.format(diffusion_dataset['rewards'].shape[0] / diffusion_length))
+            
         if 'contexts' not in diffusion_dataset:
             diffusion_dataset['contexts'] = np.ones((diffusion_dataset["rewards"].shape[0], dataset["contexts"].shape[1]), dtype=np.float32) * context
             
@@ -398,10 +534,8 @@ def prepare_replay_buffer(
             print('Limited diffusion dataset to {} samples'.format(diffusion_config.sample_limit))
 
         dataset = diffusion_dataset
-        if context_aware:
-            state_mean_buffer, state_std_buffer = compute_mean_std(np.concatenate([dataset["observations"], dataset["contexts"]], axis=1), eps=1e-3)
-        else:
-            state_mean_buffer, state_std_buffer = compute_mean_std(dataset["observations"], eps=1e-3)
+        state_mean_buffer, state_std_buffer = compute_mean_std(dataset["observations"], eps=1e-3)
+        
         buffer_args = {
         'reward_normalizer': reward_normalizer,
         'state_normalizer': StateNormalizer(state_mean_buffer, state_std_buffer),
@@ -422,6 +556,7 @@ def prepare_replay_buffer(
 
         replay_buffer = DiffusionGenerator(
             env_name=env_name,
+            dataset = dataset,
             diffusion_path=diffusion_config.path,
             use_ema=True,
             num_steps=diffusion_config.num_steps,

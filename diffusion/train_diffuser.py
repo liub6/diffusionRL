@@ -10,71 +10,16 @@ import numpy as np
 import torch
 import wandb
 
-from synther.diffusion.elucidated_diffusion import Trainer
-from synther.diffusion.norm import MinMaxNormalizer
-from synther.diffusion.utils import make_inputs, split_diffusion_samples, construct_diffusion_model
+from synther.diffusion.elucidated_diffusion import Trainer, SimpleDiffusionGenerator
+
+from synther.diffusion.utils import make_inputs, construct_diffusion_model
 
 from dmc2gymnasium import DMCGym
 
-@gin.configurable
-class SimpleDiffusionGenerator:
-    def __init__(
-            self,
-            env: gym.Env,
-            ema_model,
-            num_sample_steps: int = 128,
-            sample_batch_size: int = 100000,
-    ):
-        self.env = env
-        self.diffusion = ema_model
-        self.diffusion.eval()
-        # Clamp samples if normalizer is MinMaxNormalizer
-        self.clamp_samples = isinstance(self.diffusion.normalizer, MinMaxNormalizer)
-        self.num_sample_steps = num_sample_steps
-        self.sample_batch_size = sample_batch_size
-        print(f'Sampling using: {self.num_sample_steps} steps, {self.sample_batch_size} batch size.')
+from torch.utils.data import random_split
 
-    def sample(
-            self,
-            num_samples: int,
-            cond: torch.Tensor = None,
-    ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray):
-        assert num_samples % self.sample_batch_size == 0, 'num_samples must be a multiple of sample_batch_size'
-        num_batches = num_samples // self.sample_batch_size
-        observations = []
-        actions = []
-        rewards = []
-        next_observations = []
-        terminals = []
-        for i in range(num_batches):
-            print(f'Generating split {i + 1} of {num_batches}')
-            sampled_outputs = self.diffusion.sample(
-                batch_size=self.sample_batch_size,
-                num_sample_steps=self.num_sample_steps,
-                clamp=self.clamp_samples,
-                cond=cond,
-            )
-            sampled_outputs = sampled_outputs.cpu().numpy()
+from dm_control import suite
 
-            # Split samples into (s, a, r, s') format
-            transitions = split_diffusion_samples(sampled_outputs, self.env)
-            if len(transitions) == 4:
-                obs, act, rew, next_obs = transitions
-                terminal = np.zeros_like(next_obs[:, 0])
-            else:
-                obs, act, rew, next_obs, terminal = transitions
-            observations.append(obs)
-            actions.append(act)
-            rewards.append(rew)
-            next_observations.append(next_obs)
-            terminals.append(terminal)
-        observations = np.concatenate(observations, axis=0)
-        actions = np.concatenate(actions, axis=0)
-        rewards = np.concatenate(rewards, axis=0)
-        next_observations = np.concatenate(next_observations, axis=0)
-        terminals = np.concatenate(terminals, axis=0)
-
-        return observations, actions, rewards, next_observations, terminals
 
 
 if __name__ == '__main__':
@@ -87,10 +32,13 @@ if __name__ == '__main__':
     parser.add_argument('--wandb-entity', type=str, default="")
     parser.add_argument('--wandb-group', type=str, default="Dataset")
     #
+    parser.add_argument('--segment', type=str, default=None)
     parser.add_argument('--results_folder', type=str, default='./results')
     parser.add_argument('--use_gpu', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--save_samples', type=int, default=int(0))
+    parser.add_argument('--num_transition', type=int, default=int(1))
+    parser.add_argument('--train_num_steps', type=int, default=int(3e5))
     parser.add_argument('--save_num_samples', type=int, default=int(5e6))
     parser.add_argument('--save_file_name', type=str, default='5m_samples.npz')
     parser.add_argument('--load_checkpoint', type=int, default=int(0))
@@ -113,12 +61,15 @@ if __name__ == '__main__':
     if args.minari:
         env = DMCGym("cartpole", "swingup", task_kwargs={'random':args.seed})
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        inputs = make_inputs(args.dataset, context=True)
+        inputs = make_inputs(args.dataset, context=True, segment=args.segment)
         inputs = torch.from_numpy(inputs[0]).float(), torch.from_numpy(inputs[1]).float()
         # print(inputs[0].shape, inputs[1].shape)
         dataset = torch.utils.data.TensorDataset(*inputs)
         print("save_samples: ", args.save_samples)
         print("load_checkpoint: ", args.load_checkpoint)
+        train_size = int(0.8 * len(dataset))  # 80% 用于训练
+        test_size = len(dataset) - train_size  # 20% 用于测试
+        train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
     else:
         env = gym.make(args.dataset)
         inputs = make_inputs(env)
@@ -134,9 +85,11 @@ if __name__ == '__main__':
     diffusion = construct_diffusion_model(inputs=inputs[0] if args.minari else inputs, cond_dim=len(args.cond) if args.cond is not None else None)
     trainer = Trainer(
         diffusion,
-        dataset,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
         results_folder=args.results_folder,
-        # train_num_steps=10,
+        train_num_steps=args.train_num_steps,
+        env = suite.load(domain_name="cartpole", task_name="swingup")
     )
 
     if not args.load_checkpoint:
@@ -164,6 +117,7 @@ if __name__ == '__main__':
         observations, actions, rewards, next_observations, terminals = generator.sample(
             num_samples=args.save_num_samples,
             cond=torch.tensor(args.cond, dtype=torch.float32)[:, None] if args.cond is not None else None,
+            num_transition=args.num_transition,
         )
         np.savez_compressed(
             results_folder / (args.save_file_name + "_" + "_".join(map(str, args.cond)) if args.cond else ""),

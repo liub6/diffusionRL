@@ -72,7 +72,7 @@ class TrainConfig:
     group: str = "EDAC"
     name: str = "EDAC"
     # model params
-    hidden_dim: int = 256
+    hidden_dim: int = 128
     num_critics: int = 10
     gamma: float = 0.99
     tau: float = 5e-3
@@ -405,7 +405,7 @@ class EDAC:
 
         loss = critic_loss + self.eta * diversity_loss
 
-        return loss
+        return loss, q_values
 
     def update(self, batch: TensorBatch) -> Dict[str, float]:
         state, action, reward, next_state, done = [arr.to(self.device) for arr in batch]
@@ -427,7 +427,7 @@ class EDAC:
         self.actor_optimizer.step()
 
         # Critic update
-        critic_loss = self._critic_loss(state, action, reward, next_state, done)
+        critic_loss, q_values = self._critic_loss(state, action, reward, next_state, done)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
@@ -443,6 +443,7 @@ class EDAC:
             q_random_std = self.critic(state, random_actions).std(0).mean().item()
 
         update_info = {
+            "q_values": q_values.mean().item(),
             "alpha_loss": alpha_loss.item(),
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),

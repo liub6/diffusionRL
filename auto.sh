@@ -2,6 +2,9 @@
 
 # Viriables
 names=("front" "middle" "rear" "extremes")
+
+# names=("front")
+
 train_lengths_list=(
     "0.15 0.25 0.35 0.45"
     "0.25 0.35 0.45 0.55"
@@ -14,6 +17,9 @@ test_lengths_list=(
     "0.1 0.2 0.3"
     "0.3 0.4 0.5"
 )
+
+file=${1:-'td3_bc'}
+
 # test_lengths_list=(
 #     "0.15 0.25 0.35 0.45"
 #     "0.25 0.35 0.45 0.55"
@@ -94,8 +100,14 @@ train_union_lengths_list=("${!train_union_array[@]}")
 #     sleep 0.1
 # done
 
+# # Get trainning data
+# for length in {1..800}
+# do
+#     sbatch ./sac.sh ${length}
+#     sleep 0.1
+# done
 
-# Combine the training datasets
+# # Combine the training datasets
 # declare -a train_dataset_name=()
 # for length in "${train_union_lengths_list[@]}"; do
 #     for i in {0..5}; do
@@ -105,6 +117,19 @@ train_union_lengths_list=("${!train_union_array[@]}")
 #     yes | minari delete ${train_dataset_name[@]}
 #     train_dataset_name=()
 # done
+
+# Combine the training datasets
+# declare -a train_dataset_name=()
+
+# for i in {3..800}; do
+#     train_dataset_name+="dm-cartpole-test-length${i}.0-v0 "
+#     # yes | minari delete "dm-cartpole-test-length${i}.0-v0"
+# done
+# minari combine ${train_dataset_name[@]}--dataset-id=dm-cartpole-train-length-all-v0
+# # yes | minari delete ${train_dataset_name[@]}
+# train_dataset_name=()
+
+
 # for i in "${!names[@]}"; do
 #     name=${names[$i]}
 #     train_lengths=${train_lengths_list[$i]}
@@ -121,140 +146,61 @@ train_union_lengths_list=("${!train_union_array[@]}")
 # done
 
 
+# Train the diffuser
+jobids=()
+for i in "${!names[@]}"; do
+    name=${names[$i]}
+    read -a test_lengths <<< "${test_lengths_list[$i]}"
 
-# # Train the diffuser
-# jobids=()
-# for i in "${!names[@]}"; do
-#     name=${names[$i]}
-#     read -a test_lengths <<< "${test_lengths_list[$i]}"
+    # Train the diffuser
+    # sbatch ./diffusion.sh \
+    # 0.1 \                                        #cond for trianing could be any value
+    # True \                                       #minari
+    # "dm-cartpole-train-length-${name}-v0" \      #dataset
+    # "./results-${name}" \                        #results_folder
+    # False \                                       #save_samples
+    # False                                        #load_checkpoint
 
-#     # Train the diffuser
-#     # sbatch ./diffusion.sh \
-#     # 0.1 \                                        #cond for trianing could be any value
-#     # True \                                       #minari
-#     # "dm-cartpole-train-length-${name}-v0" \      #dataset
-#     # "./results-${name}" \                        #results_folder
-#     # False \                                       #save_samples
-#     # False                                        #load_checkpoint
-
-#     jobid=$(sbatch ./diffusion.sh \
-#     0.1 \
-#     1 \
-#     "dm-cartpole-train-length-${name}-v0" \
-#     "./results-${name}" \
-#     0 \
-#     0 | awk '{print $4}')
-#     jobids+=($jobid)
-#     sleep 0.1
-# done
-# dependency_str="afterok"
-# for jobid in "${jobids[@]}"; do
-#     dependency_str="${dependency_str}:${jobid}"
-# done
-
-
-# # Generate the dataset
-# jobids=()
-# for i in "${!names[@]}"; do
-#     name=${names[$i]}
-
-#     for length in "${test_union_lengths_list[@]}"
-#     do
-#         jobid=$(sbatch --dependency=$dependency_str ./diffusion.sh \
-#         ${length} \
-#         1 \
-#         "dm-cartpole-train-length-${name}-v0" \
-#         "./results-${name}" \
-#         1 \
-#         1 | awk '{print $4}')
-#         jobids+=($jobid)
-#         sleep 0.1
-#     done
-# done
-# dependency_str="afterok"
-# for jobid in "${jobids[@]}"; do
-#     dependency_str="${dependency_str}:${jobid}"
-# done
+    jobid=$(sbatch ./diffusion.sh \
+    0.1 \
+    1 \
+    "dm-cartpole-train-length-all-v0" \
+    "./results-${name}" \
+    0 \
+    0 \
+    ${name} | awk '{print $4}')
+    jobids+=($jobid)
+    sleep 0.1
+done
+dependency_str="afterok"
+for jobid in "${jobids[@]}"; do
+    dependency_str="${dependency_str}:${jobid}"
+done
 
 
-# # Test the diffuser
-# jobids=()
-# for i in "${!names[@]}"; do
-#     name=${names[$i]}
+# Generate the dataset
+jobids=()
+for i in "${!names[@]}"; do
+    name=${names[$i]}
 
-#     for length in "${test_union_lengths_list[@]}"
-#     do
-#         for seed in "${seeds[@]}"
-#         do
-#             :
-#             # Test the diffuser
-#             # sbatch ./td3_bc.sh \
-#             # ./corl/yaml/td3_bc/cartpole/cartpole_swingup.yaml \             #config
-#             # ./corl_logs/ \                                                  #checkpoints_path
-#             # "${name}-${length}-${seed}" \                                   #name
-#             # "./results-${name}/5m_samples.npz_${length}.npz" \              #diffusion.path
-#             # ${length} \                                                     #pole_length
-#             # "dm-cartpole-train-length-${name}-v0" \                         #dataset
-#             # False \                                                         #context_aware
-#             # ${seed}                                                         #seed
-
-#             # Diffuser
-#             sbatch --dependency=$dependency_str ./test_diffuser.sh \
-#             $1 \
-#             ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
-#             ./corl_logs/ \
-#             "diffuser-${name}-${length}-${seed}" \
-#             "./results-${name}/5m_samples.npz_${length}.npz" \
-#             ${length} \
-#             "dm-cartpole-train-length-${name}-v0" \
-#             0 \
-#             ${seed}
-#             sleep 0.1
-
-#             # Context aware
-#             sbatch --dependency=$dependency_str ./test_diffuser.sh \
-#             $1 \
-#             ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
-#             ./corl_logs/ \
-#             "context-aware-${name}-${length}-${seed}" \
-#             "None" \
-#             ${length} \
-#             "dm-cartpole-train-length-${name}-v0" \
-#             1 \
-#             ${seed}
-#             sleep 0.1
-
-#             # Diffuser + context aware
-#             sbatch --dependency=$dependency_str ./test_diffuser.sh \
-#             $1 \
-#             ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
-#             ./corl_logs/ \
-#             "diffuser-context-aware-${name}-${length}-${seed}" \
-#             "./results-${name}/5m_samples.npz_${length}.npz" \
-#             ${length} \
-#             "dm-cartpole-train-length-${name}-v0" \
-#             1 \
-#             ${seed}
-#             sleep 0.1
-
-#             # True
-#             sbatch --dependency=$dependency_str ./test_diffuser.sh \
-#             $1 \
-#             ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
-#             ./corl_logs/ \
-#             "true-${name}-${length}-${seed}" \
-#             "None" \
-#             ${length} \
-#             "dm-cartpole-train-length-${name}-v0" \
-#             0 \
-#             ${seed}
-#             sleep 0.1
-#         done
-#     done
-# done
-
-
-
+    for length in "${test_union_lengths_list[@]}"
+    do
+        jobid=$(sbatch --dependency=$dependency_str ./diffusion.sh \
+        ${length} \
+        1 \
+        "dm-cartpole-train-length-all-v0" \
+        "./results-${name}" \
+        1 \
+        1 \
+        ${name} | awk '{print $4}')
+        jobids+=($jobid)
+        sleep 0.1
+    done
+done
+dependency_str="afterok"
+for jobid in "${jobids[@]}"; do
+    dependency_str="${dependency_str}:${jobid}"
+done
 
 
 # Test the diffuser
@@ -279,58 +225,144 @@ for i in "${!names[@]}"; do
             # ${seed}                                                         #seed
 
             # Diffuser
-            sbatch ./test_diffuser.sh \
-            $1 \
-            ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
+            sbatch --dependency=$dependency_str ./test_diffuser.sh \
+            $file \
+            ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
             ./corl_logs/ \
             "diffuser-${name}-${length}-${seed}" \
             "./results-${name}/5m_samples.npz_${length}.npz" \
             ${length} \
-            "dm-cartpole-train-length-${name}-v0" \
+            "dm-cartpole-train-length-all-v0" \
             0 \
-            ${seed}
+            ${seed} \
+            ${name} 
             sleep 0.1
 
             # Context aware
-            sbatch ./test_diffuser.sh \
-            $1 \
-            ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
+            sbatch --dependency=$dependency_str ./test_diffuser.sh \
+            $file \
+            ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
             ./corl_logs/ \
             "context-aware-${name}-${length}-${seed}" \
             "None" \
             ${length} \
-            "dm-cartpole-train-length-${name}-v0" \
+            "dm-cartpole-train-length-all-v0" \
             1 \
-            ${seed}
+            ${seed} \
+            ${name} 
             sleep 0.1
 
             # Diffuser + context aware
-            sbatch ./test_diffuser.sh \
-            $1 \
-            ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
+            sbatch --dependency=$dependency_str ./test_diffuser.sh \
+            $file \
+            ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
             ./corl_logs/ \
             "diffuser-context-aware-${name}-${length}-${seed}" \
             "./results-${name}/5m_samples.npz_${length}.npz" \
             ${length} \
-            "dm-cartpole-train-length-${name}-v0" \
+            "dm-cartpole-train-length-all-v0" \
             1 \
-            ${seed}
+            ${seed} \
+            ${name} 
             sleep 0.1
 
             # True
-            sbatch ./test_diffuser.sh \
-            $1 \
-            ./corl/yaml/$1/cartpole/cartpole_swingup.yaml \
+            sbatch --dependency=$dependency_str ./test_diffuser.sh \
+            $file \
+            ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
             ./corl_logs/ \
             "true-${name}-${length}-${seed}" \
             "None" \
             ${length} \
-            "dm-cartpole-train-length-${name}-v0" \
+            "dm-cartpole-train-length-all-v0" \
             0 \
-            ${seed}
+            ${seed} \
+            ${name} 
             sleep 0.1
         done
     done
 done
+
+# ********************************************************************************************************************
+
+# # Test the diffuser
+# jobids=()
+# for i in "${!names[@]}"; do
+#     name=${names[$i]}
+
+#     for length in "${test_union_lengths_list[@]}"
+#     do
+#         for seed in "${seeds[@]}"
+#         do
+#             :
+#             # Test the diffuser
+#             # sbatch ./td3_bc.sh \
+#             # ./corl/yaml/td3_bc/cartpole/cartpole_swingup.yaml \             #config
+#             # ./corl_logs/ \                                                  #checkpoints_path
+#             # "${name}-${length}-${seed}" \                                   #name
+#             # "./results-${name}/5m_samples.npz_${length}.npz" \              #diffusion.path
+#             # ${length} \                                                     #pole_length
+#             # "dm-cartpole-train-length-${name}-v0" \                         #dataset
+#             # False \                                                         #context_aware
+#             # ${seed}                                                         #seed
+
+#             # Diffuser
+#             sbatch ./test_diffuser.sh \
+#             $file \
+#             ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
+#             ./corl_logs/ \
+#             "diffuser-${name}-${length}-${seed}" \
+#             "./results-${name}/5m_samples.npz_${length}.npz" \
+#             ${length} \
+#             "dm-cartpole-train-length-all-v0" \
+#             0 \
+#             ${seed} \
+#             ${name}
+#             sleep 0.1
+
+#             # Context aware
+#             sbatch ./test_diffuser.sh \
+#             $file \
+#             ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
+#             ./corl_logs/ \
+#             "context-aware-${name}-${length}-${seed}" \
+#             "None" \
+#             ${length} \
+#             "dm-cartpole-train-length-all-v0" \
+#             1 \
+#             ${seed} \
+#             ${name}
+#             sleep 0.1
+
+#             # Diffuser + context aware
+#             sbatch ./test_diffuser.sh \
+#             $file \
+#             ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
+#             ./corl_logs/ \
+#             "diffuser-context-aware-${name}-${length}-${seed}" \
+#             "./results-${name}/5m_samples.npz_${length}.npz" \
+#             ${length} \
+#             "dm-cartpole-train-length-all-v0" \
+#             1 \
+#             ${seed} \
+#             ${name}
+#             sleep 0.1
+
+#             # True
+#             sbatch ./test_diffuser.sh \
+#             $file \
+#             ./corl/yaml/$file/cartpole/cartpole_swingup.yaml \
+#             ./corl_logs/ \
+#             "true-${name}-${length}-${seed}" \
+#             "None" \
+#             ${length} \
+#             "dm-cartpole-train-length-all-v0" \
+#             0 \
+#             ${seed} \
+#             ${name}
+#             sleep 0.1
+#         done
+#     done
+# done
 
 

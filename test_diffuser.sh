@@ -6,11 +6,21 @@
 ##SBATCH --ntasks-per-node=1     # 8 MPI ranks per node, 16 total (2x8)
 ##SBATCH --gpus-per-node=1       # Allocate one gpu per MPI rank
 #SBATCH --cpus-per-task=4
-#SBATCH --time=15:00:00       # Run time (d-hh:mm:ss)
+#SBATCH --time=2:00:00       # Run time (d-hh:mm:ss)
 #SBATCH --mem=30000M
 #SBATCH --gres=gpu:1
 #SBATCH --gpus=1
 
+# echo "file $1"
+# echo "config $2"
+# echo "checkpoints_path $3"
+# echo "name $4"
+# echo "diffusion.path $5"
+# echo "pole_length $6"
+# echo "dataset $7"
+# echo "context_aware $8"
+# echo "seed $9"
+# echo "segment ${10}"
 
 srun python ./corl/algorithms/$1.py \
         --config $2 \
@@ -20,7 +30,8 @@ srun python ./corl/algorithms/$1.py \
         --pole_length $6 \
         --dataset $7 \
         --context_aware $8 \
-        --seed $9
+        --seed $9 \
+        --segment ${10}
 
 # srun python ./corl/algorithms/edac.py \
 #         --config ./corl/yaml/edac/cartpole/cartpole_swingup.yaml \

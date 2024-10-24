@@ -5,7 +5,7 @@ Code was adapted from https://github.com/lucidrains/denoising-diffusion-pytorch
 import math
 import pathlib
 from multiprocessing import cpu_count
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import gin
 import numpy as np
@@ -19,13 +19,158 @@ from redq.algos.core import ReplayBuffer
 from torch import nn
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from synther.diffusion.norm import BaseNormalizer
 from synther.online.utils import make_inputs_from_replay_buffer
+from synther.diffusion.norm import MinMaxNormalizer
+import gymnasium as gym
+from dmc2gymnasium import DMCGym
 
+# Convert diffusion samples back to (s, a, r, s') format.
+@gin.configurable
+def split_diffusion_samples(
+        samples: Union[np.ndarray, torch.Tensor],
+        env: gym.Env,
+        modelled_terminals: bool = False,
+        terminal_threshold: Optional[float] = None,
+        num_transition: int = 1,
+):
+    # Compute dimensions from env
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    # Split samples into (s, a, r, s') format
+    obs, actions, rewards, next_obs = [], [], [], []
+    for i in range(num_transition):
+        anchor = (obs_dim + action_dim + 1) * i
+        obs.append(samples[:, anchor:anchor + obs_dim])
+        actions.append(samples[:, anchor + obs_dim:anchor +  obs_dim + action_dim])
+        rewards.append(samples[:, anchor + obs_dim + action_dim])
+        next_obs.append(samples[:, anchor + obs_dim + action_dim + 1: anchor + obs_dim + action_dim + 1 + obs_dim])
+
+        obs = np.concatenate(obs, axis=0)
+        actions = np.concatenate(actions, axis=0)
+        rewards = np.concatenate(rewards, axis=0)
+        next_obs = np.concatenate(next_obs, axis=0)
+            
+        if modelled_terminals:
+            terminals = samples[:, -1]
+            if terminal_threshold is not None:
+                if isinstance(terminals, torch.Tensor):
+                    terminals = (terminals > terminal_threshold).float()
+                else:
+                    terminals = (terminals > terminal_threshold).astype(np.float32)
+            return obs, actions, rewards, next_obs, terminals
+        else:
+            return obs, actions, rewards, next_obs
+
+@gin.configurable
+class SimpleDiffusionGenerator:
+    def __init__(
+            self,
+            ema_model,
+            env: Optional[gym.Env] = None,
+            num_sample_steps: int = 128,
+            sample_batch_size: int = 100000,
+    ):
+        self.env = env
+        self.diffusion = ema_model
+        self.diffusion.eval()
+        # Clamp samples if normalizer is MinMaxNormalizer
+        self.clamp_samples = isinstance(self.diffusion.normalizer, MinMaxNormalizer)
+        self.num_sample_steps = num_sample_steps
+        self.sample_batch_size = sample_batch_size
+        print(f'Sampling using: {self.num_sample_steps} steps, {self.sample_batch_size} batch size.')
+
+    def sample(
+            self,
+            num_samples: int,
+            cond: torch.Tensor = None,
+            num_transition: int = 1,
+    ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+        assert num_samples % self.sample_batch_size == 0, 'num_samples must be a multiple of sample_batch_size'
+        num_batches = num_samples // self.sample_batch_size // num_transition
+        observations = []
+        actions = []
+        rewards = []
+        next_observations = []
+        terminals = []
+        for i in range(num_batches):
+            print(f'Generating split {i + 1} of {num_batches}')
+            sampled_outputs = self.diffusion.sample(
+                batch_size=self.sample_batch_size,
+                num_sample_steps=self.num_sample_steps,
+                clamp=self.clamp_samples,
+                cond=cond,
+            )
+            sampled_outputs = sampled_outputs.cpu().numpy()
+
+            # Split samples into (s, a, r, s') format
+            transitions = split_diffusion_samples(sampled_outputs, DMCGym("cartpole", "swingup", task_kwargs={'random':1}), num_transition=num_transition)
+            if len(transitions) == 4:
+                obs, act, rew, next_obs = transitions
+                terminal = np.zeros_like(next_obs[:, 0])
+            else:
+                obs, act, rew, next_obs, terminal = transitions
+            observations.append(obs)
+            actions.append(act)
+            rewards.append(rew)
+            next_observations.append(next_obs)
+            terminals.append(terminal)
+        observations = np.concatenate(observations, axis=0)
+        actions = np.concatenate(actions, axis=0)
+        rewards = np.concatenate(rewards, axis=0)
+        next_observations = np.concatenate(next_observations, axis=0)
+        terminals = np.concatenate(terminals, axis=0)
+
+        return observations, actions, rewards, next_observations, terminals
 
 # helpers
+
+def _flatten_obs(obs, dtype=np.float32):
+    obs_pieces = []
+    for v in obs.values():
+        flat = np.array([v]) if np.isscalar(v) else v.ravel()
+        obs_pieces.append(flat)
+    return np.concatenate(obs_pieces, axis=0).astype(dtype)
+
+def reset_to_state(env, state):
+    env._reset_next_step = False
+    env._step_count = 0
+    with env._physics.reset_context():
+        env._physics.named.data.qpos[:] = np.array([state[0], state[1]])
+        env._physics.named.data.qvel[:] = np.array([state[2], state[3]])
+    env._task.after_step(env._physics)
+    
+def calculate_diffusion_loss(diffusion_dataset, env, range = None):
+    if range is None:
+        range = diffusion_dataset["observations"].shape[0]
+    reward_loss = np.zeros((range, 1))
+    observation_loss = np.zeros((range, diffusion_dataset["observations"].shape[1]))
+
+    # for transition in trange(diffusion_dataset["observations"].shape[0]):
+    for transition in trange(range):
+        index = np.ones(diffusion_dataset["observations"].shape[1], dtype=bool)
+        index[2] = False
+        observation = diffusion_dataset["observations"][transition]
+        state = observation[index]
+        # state[1] = np.arccos(state[1].clip(-1, 1))
+        state[1] = np.arctan2(observation[2], observation[1])
+        action = diffusion_dataset["actions"][transition]
+        reward = diffusion_dataset["rewards"][transition]
+        next_observation = diffusion_dataset["next_observations"][transition]
+
+        # if transition == 0:
+        #     print(observation, action, reward, next_observation)
+        reset_to_state(env, state)
+        timestamp = env.step(action)
+        reward_true = timestamp.reward
+        next_observation_true = _flatten_obs(timestamp.observation)
+        reward_loss[transition, :] = np.abs(reward - reward_true)
+        observation_loss[transition, :] = np.abs(next_observation - next_observation_true)
+    return observation_loss, reward_loss
+
+
 def exists(val):
     return val is not None
 
@@ -269,8 +414,9 @@ class Trainer(object):
     def __init__(
             self,
             diffusion_model,
-            dataset: Optional[torch.utils.data.Dataset] = None,
-            train_batch_size: int = 16,
+            train_dataset: Optional[torch.utils.data.Dataset] = None,
+            test_dataset: Optional[torch.utils.data.Dataset] = None,
+            train_batch_size: int = 32,
             small_batch_size: int = 16,
             gradient_accumulate_every: int = 1,
             train_lr: float = 1e-4,
@@ -285,8 +431,11 @@ class Trainer(object):
             amp: bool = False,
             fp16: bool = False,
             split_batches: bool = True,
+            env = None,
+            eval_interval = 1000,
     ):
         super().__init__()
+        self.eval_interval = eval_interval
         self.accelerator = Accelerator(
             split_batches=split_batches,
             mixed_precision='fp16' if fp16 else 'no'
@@ -301,21 +450,28 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
         self.gradient_accumulate_every = gradient_accumulate_every
 
-        if dataset is not None:
+        if train_dataset is not None:
             # If dataset size is less than 800K use the small batch size
-            if len(dataset) < int(8e5):
+            if len(train_dataset) < int(8e5):
                 self.batch_size = small_batch_size
             else:
                 self.batch_size = train_batch_size
             print(f'Using batch size: {self.batch_size}')
             # dataset and dataloader
-            dl = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count())
+            # dl = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count()//2)
+            dl = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=4)
             dl = self.accelerator.prepare(dl)
             self.dl = cycle(dl)
         else:
             # No dataloader, train batch by batch
             self.batch_size = train_batch_size
             self.dl = None
+            
+        if test_dataset is not None:
+            # self.eval_dl = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count()//2)
+            self.eval_dl = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=4)
+            self.eval_dl = self.accelerator.prepare(self.eval_dl)
+            self.eval_dl = cycle(self.eval_dl)
 
         # optimizer, make sure that the bias and layer-norm weights are not decayed
         no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
@@ -360,6 +516,13 @@ class Trainer(object):
 
         self.model.normalizer.to(self.accelerator.device)
         self.ema.ema_model.normalizer.to(self.accelerator.device)
+        
+        self.generator = SimpleDiffusionGenerator(
+            env=env,
+            ema_model=self.ema.ema_model,
+            sample_batch_size = 1000,
+        )
+        self.env = env
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -391,6 +554,39 @@ class Trainer(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
+
+    def evaluate(self, accumulate_every = 100):
+        accelerator = self.accelerator
+        device = accelerator.device
+        self.model.eval()
+        
+        eval_loss = 0.
+        for i in range(accumulate_every):
+            with torch.no_grad():
+                if type(next(self.eval_dl)) != torch.Tensor:
+                    data, context = next(self.eval_dl)
+                    data, context = data.to(device), context.to(device)
+                    print(context)
+                else:
+                    data, context = (next(self.eval_dl)[0]).to(device), None
+
+                with self.accelerator.autocast():
+                    loss = self.model(data, cond=context)
+
+            eval_loss += loss.item()
+        eval_loss /= accumulate_every
+        
+        print(f'Evaluation loss: {eval_loss:.4f}')
+        wandb.log({
+            'eval_loss': eval_loss,
+            'step': self.step
+        })
+        accelerator.wait_for_everyone()
+        # accelerator.free_memory()
+        
+        self.model.train()
+    
+    
     # Train for the full number of steps.
     def train(self):
         accelerator = self.accelerator
@@ -424,6 +620,33 @@ class Trainer(object):
                     'lr': self.opt.param_groups[0]['lr']
                 })
 
+                if self.step % self.eval_interval == 0:
+                    self.evaluate()
+                    for cond in (0.2, 0.4 ,0.6):
+                        observations, actions, rewards, next_observations, terminals = self.generator.sample(
+                            num_samples=self.generator.sample_batch_size,
+                            cond=torch.tensor([cond], dtype=torch.float32)[:, None],
+                            num_transition=1,
+                        )
+                        observation_err, reward_err = calculate_diffusion_loss(
+                            {
+                                "observations": observations,
+                                "actions": actions,
+                                "rewards": rewards,
+                                "next_observations": next_observations,
+                                "terminals": terminals,
+                            },
+                            self.env,
+                        )
+                        wandb.log({
+                            'pos_1_mse_eval_len= ' + str(cond): np.mean(observation_err[0]),
+                            'pos_2_mse_eval_len= ' + str(cond): np.mean(observation_err[1]),
+                            'pos_3_mse_eval_len= ' + str(cond): np.mean(observation_err[2]),
+                            'vel_1_mse_eval_len= ' + str(cond): np.mean(observation_err[3]),
+                            'vel_2_mse_eval_len= ' + str(cond): np.mean(observation_err[4]),
+                            'reward_mse_eval_len= ' + str(cond): np.mean(reward_err),
+                        })
+                
                 accelerator.wait_for_everyone()
 
                 self.opt.step()
@@ -443,6 +666,8 @@ class Trainer(object):
 
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
+                    
+                
 
         accelerator.print('training complete')
 
@@ -535,7 +760,7 @@ class REDQTrainer(Trainer):
     ):
         super().__init__(
             diffusion_model,
-            dataset=None,
+            train_dataset=None,
             train_batch_size=train_batch_size,
             gradient_accumulate_every=gradient_accumulate_every,
             train_lr=train_lr,

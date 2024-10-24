@@ -4,9 +4,9 @@
 ##SBATCH --ntasks-per-node=1     # 8 MPI ranks per node, 16 total (2x8)
 ##SBATCH --gpus-per-node=1       # Allocate one gpu per MPI rank
 #SBATCH --cpus-per-task=4
-#SBATCH --time=15:00:00       # Run time (d-hh:mm:ss)
+#SBATCH --time=6:00:00       # Run time (d-hh:mm:ss)
 #SBATCH --mem=30000M
-#SBATCH --partition=gpu-v100-32g
+#SBATCH --gres=gpu:1
 
 
 srun python ./corl/algorithms/td3_bc.py \
@@ -17,7 +17,8 @@ srun python ./corl/algorithms/td3_bc.py \
         --pole_length $5 \
         --dataset $6 \
         --context_aware $7 \
-        --seed $8
+        --seed $8 \
+        --segment $9
 
 # srun python ./corl/algorithms/edac.py \
 #         --config ./corl/yaml/edac/cartpole/cartpole_swingup.yaml \

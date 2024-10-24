@@ -37,7 +37,7 @@ import wandb
 from synther.corl.shared.buffer import prepare_replay_buffer, RewardNormalizer, StateNormalizer, DiffusionConfig, DiffusionGenerator
 from synther.corl.shared.logger import Logger
 from synther.diffusion.utils import make_inputs
-
+from dm_control import suite
 
 
 def set_pole_length(
@@ -65,8 +65,9 @@ class TrainConfig:
     # Experiment
     context_aware: int = 0
     diffuser: bool = True
-    context_and_diffuser: bool = False
+    segment: Optional[str] = None
     pole_length: Optional[float] = None  #half pole length. 0.045 defalt
+    percentile: Optional[int] = None
     cond: list = None  
     cond_dim: int = None
     device: str = "cuda"
@@ -93,24 +94,21 @@ class TrainConfig:
     normalize: bool = True  # Normalize states
     normalize_reward: bool = False  # Normalize reward
     # Wandb logging
-    project: str = "DiffusionRL-td3_bc"
+    project: str = "DiffusionRL-td3_bc_non_filtered_1"
     group: str = "TD3_BC"
     name: str = "Dataset0.025-0.35"
     # Diffusion config
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     # Network size
-    network_width: int = 256
-    network_depth: int = 2
+    network_width: int = 64
+    network_depth: int = 5
     dataset: str = "dm-cartpole-test-length0.025-0.35-v0"
 
     def __post_init__(self):
         if self.diffusion.path == "None":
             self.diffusion.path = None
         self.diffuser = True if self.diffusion.path is not None else False
-        self.context_and_diffuser = self.context_aware and self.diffuser
-        if self.context_and_diffuser:
-            print("context_and_diffuser") 
-        elif self.context_aware:
+        if self.context_aware:
             print("context_aware")
         elif self.diffuser:
             print("diffuser")
@@ -141,25 +139,25 @@ def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.nda
 def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
     return (states - mean) / std
     
-def wrap_env(
-        env: gym.Env,
-        state_mean: Union[np.ndarray, float] = 0.0,
-        state_std: Union[np.ndarray, float] = 1.0,
-        reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-                state - state_mean
-        ) / state_std  # epsilon should be already added in std.
+# def wrap_env(
+#         env: gym.Env,
+#         state_mean: Union[np.ndarray, float] = 0.0,
+#         state_std: Union[np.ndarray, float] = 1.0,
+#         reward_scale: float = 1.0,
+# ) -> gym.Env:
+#     # PEP 8: E731 do not assign a lambda expression, use a def
+#     def normalize_state(state):
+#         return (
+#                 state - state_mean
+#         ) / state_std  # epsilon should be already added in std.
 
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
+#     def scale_reward(reward):
+#         # Please be careful, here reward is multiplied by scale!
+#         return reward_scale * reward
+#     env = gym.wrappers.TransformObservation(env, normalize_state)
+#     if reward_scale != 1.0:
+#         env = gym.wrappers.TransformReward(env, scale_reward)
+#     return env
 
 
 def set_seed(
@@ -234,6 +232,19 @@ class Step_n_feedback(nn.Module):
     def forward(self, input):
         return StepModule.apply(input)
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, activation: str = "relu", layer_norm: bool = True):
+        super().__init__()
+        self.linear = nn.Linear(dim_in, dim_out, bias=True)
+        if layer_norm:
+            self.ln = nn.LayerNorm(dim_in)
+        else:
+            self.ln = torch.nn.Identity()
+        self.activation = getattr(F, activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.linear(self.activation(self.ln(x)))
+    
 class Actor(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, max_action: float, hidden_dim: int = 256, n_hidden: int = 2):
         super(Actor, self).__init__()
@@ -245,10 +256,10 @@ class Actor(nn.Module):
         # layers.append(nn.Linear(hidden_dim, action_dim))
         # layers.append(nn.Tanh())
         
-        layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
-        for _ in range(n_hidden - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
+        layers = [nn.Linear(state_dim, hidden_dim)]
+        for _ in range(n_hidden):
+            layers.append(ResidualBlock(hidden_dim, hidden_dim, activation='relu'))
+            
         layers.append(nn.Linear(hidden_dim, action_dim))
         layers.append(nn.Tanh())
         self.net = nn.Sequential(*layers)
@@ -268,10 +279,10 @@ class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, n_hidden: int = 2):
         super(Critic, self).__init__()
 
-        layers = [nn.Linear(state_dim + action_dim, hidden_dim), nn.ReLU()]
-        for _ in range(n_hidden - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
+        layers = [nn.Linear(state_dim + action_dim, hidden_dim)]
+        for _ in range(n_hidden):
+            layers.append(ResidualBlock(hidden_dim, hidden_dim, activation='relu'))
+
         layers.append(nn.Linear(hidden_dim, 1))
         self.net = nn.Sequential(*layers)
 
@@ -351,6 +362,8 @@ class TD3_BC:  # noqa
         # Compute critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         log_dict["critic_loss"] = critic_loss.item()
+        log_dict["q1"] = current_q1.mean().item()
+        log_dict["q2"] = current_q2.mean().item()
         # Optimize the critic
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
@@ -416,7 +429,7 @@ def train(config: TrainConfig):
         torch.cuda.manual_seed(config.seed)
     if config.env == "cartpole":
         env = DMCGym("cartpole", "swingup", task_kwargs={'random':config.seed})
-        inputs = make_inputs(config.dataset, original=True, context=False)
+        inputs = make_inputs(config.dataset, original=True, context=False, segment=config.segment)
         dataset = inputs
         import re
         match = re.search(r'length(.+?)-v0', config.dataset)
@@ -451,6 +464,8 @@ def train(config: TrainConfig):
         cond_dim=config.cond_dim,
         context_aware=config.context_aware,
         context=config.pole_length,
+        percentile=config.percentile,
+        env=suite.load(domain_name="cartpole", task_name="swingup"),
     )
 
     max_action = float(env.action_space.high[0])
@@ -530,7 +545,7 @@ def train(config: TrainConfig):
 
         if t % config.log_every == 0:
             wandb.log(log_dict, step=trainer.total_it)
-            logger.log({'step': trainer.total_it, **log_dict}, mode='train')
+            # logger.log({'step': trainer.total_it, **log_dict}, mode='train')
 
         # Evaluate episode
         if t % config.eval_freq == 0 or t == config.max_timesteps - 1:
@@ -565,7 +580,7 @@ def train(config: TrainConfig):
             # log_dict = {"d4rl_normalized_score": normalized_eval_score}
             log_dict = {"evaluate_return": eval_score}
             wandb.log(log_dict, step=trainer.total_it)
-            logger.log({'step': trainer.total_it, **log_dict}, mode='eval')
+            # logger.log({'step': trainer.total_it, **log_dict}, mode='eval')
 
 
 if __name__ == "__main__":
